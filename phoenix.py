@@ -11,63 +11,87 @@ from agents.agents import RegularAgent, Curator
 
 
 class Phoenix:
-    """Phoenix architecture — blackboard system with Alchemist"""
+    """Phoenix architecture - blackboard system with Alchemist"""
 
     MAX_ROUNDS = 20
 
-    def __init__(self, problem: str, api_key: str = None):
-        self.problem = problem
+    def __init__(self, config, api_key: str = None):
+        self.problem = config.problem.strip()
         self.client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
         self.bb = Blackboard()
 
         self.agents = [
-            RegularAgent("Lawyer", self.client),
-            RegularAgent("Architect", self.client),
-            RegularAgent("Security Expert", self.client),
-            RegularAgent("Clinician", self.client),
-            RegularAgent("Patient", self.client),
+            RegularAgent(role, self.client, prompt)
+            for role, prompt in config.agents.items()
         ]
         self.curator  = Curator(self.client)
         self.guardian = Guardian(self.bb)
-        self.alchemist = Alchemist(self.bb, self.client, problem)
+        self.alchemist = Alchemist(self.bb, self.client, self.problem)
 
         self.state = "running"
+        self.chaos_failures = 0  # consecutive failed Chaos cycles
+        self.MAX_CHAOS_FAILURES = 3  # Limes after this many failures
 
     def _run_normal_round(self):
         """Normal round — agents contribute, Curator evaluates"""
-        print(f"\n{'─'*50}")
+        print(f"\n{'-'*50}")
         print(f"ROUND {self.bb.current_round} — Normal flow")
-        print(f"{'─'*50}")
+        print(f"{'-'*50}")
 
         new_entries = []
         for agent in self.agents:
             entry = agent.contribute(self.bb, self.problem)
-            print(f"  [{agent.name}]: {entry.content[:80]}...")
+            print(f"  [{agent.name}]: {entry.content}")
             new_entries.append(entry)
 
         print(f"\n  Curator evaluating...")
         for entry in new_entries:
-            self.curator.rate_and_record(entry, self.problem, self.bb)
+            is_dup, dup_reason = self.guardian.is_duplicate(entry)
+            if is_dup:
+                # Mathematical duplicate — skip Curator, record Plumbum directly
+                from boards.blackboard import Entry as E
+                dup_entry = E(
+                    agent=self.curator.name,
+                    content=f"Duplicate [{entry.id}] {entry.agent}: {dup_reason}",
+                    tag=Tag.PLUMBUM,
+                    ref=entry.id
+                )
+                self.bb.add_rating(dup_entry)
+                print(f"  [Guardian] DUP {entry.agent}: {dup_reason}")
+            else:
+                self.curator.rate_and_record(entry, self.problem, self.bb)
 
     def _run_chaos_cycle(self) -> bool:
         """
         Chaos cycle — Alchemist tries to unblock the system.
         Returns True if success (Aurum), False if Limes.
         """
-        print(f"\n{'═'*50}")
+        print(f"\n{'='*50}")
         print(f"CHAOS — Alchemist waking up")
-        print(f"{'═'*50}")
+        print(f"{'='*50}")
 
         self.guardian.call_chaos()
 
         while self.alchemist.attempt_count < self.alchemist.MAX_ATTEMPTS:
             lux_entry = self.alchemist.attempt()
 
+            # Skip Curator for BRAKE FAIL entries — they go straight to dead branch
+            if "[BRAKE FAIL" in lux_entry.content:
+                print(f"  [Alchemist] BRAKE FAIL — skipping Curator, going to dead branch.")
+                self.bb.ideas.remove(lux_entry)  # remove from ideas
+                self.bb.add_to_dead_branch(Entry(
+                    agent=self.alchemist.name,
+                    content=f"Brake fail: {lux_entry.content}",
+                    tag=Tag.PLUMBUM
+                ))
+                self.alchemist.receive_curator_feedback("Brake failed — solution incompatible with problem shape.")
+                continue
+
             print(f"\n  [Curator] Evaluating Lux...")
             curator_entry = self.curator.rate_and_record(lux_entry, self.problem, self.bb)
 
             if curator_entry.tag == Tag.AURUM:
-                print(f"\n  ✓ Curator accepted Lux as Aurum!")
+                print(f"\n  [OK] Curator accepted Lux as Aurum!")
                 print(f"  Guardian: Waking regular agents with new impulse.")
                 self.alchemist.reset_attempts()
                 self.state = "running"
@@ -75,12 +99,12 @@ class Phoenix:
             else:
                 feedback = curator_entry.content
                 self.alchemist.receive_curator_feedback(feedback)
-                print(f"\n  ✗ Curator rejected Lux. Alchemist tries again...")
+                print(f"\n  [XX] Curator rejected Lux. Alchemist tries again...")
 
-                lux_entry.tag = Tag.PLUMBUM
+                # Move rejected Lux to dead branch
                 self.bb.add_to_dead_branch(Entry(
                     agent=self.alchemist.name,
-                    content=f"Rejected Lux: {lux_entry.content[:100]}",
+                    content=f"Rejected Lux: {lux_entry.content}",
                     tag=Tag.PLUMBUM
                 ))
 
@@ -90,10 +114,10 @@ class Phoenix:
 
     def run(self) -> dict:
         """Main Phoenix loop"""
-        print(f"\n{'█'*60}")
+        print(f"\n{'#'*60}")
         print(f"PHOENIX START")
         print(f"PROBLEM: {self.problem}")
-        print(f"{'█'*60}\n")
+        print(f"{'#'*60}\n")
 
         result = {
             "status": None,
@@ -119,7 +143,21 @@ class Phoenix:
                 result["chaos_triggered"] = True
                 success = self._run_chaos_cycle()
                 if not success:
-                    break
+                    if self.state == "limes":
+                        # Alchemist exhausted all attempts — immediate exit
+                        print(f"\n  [Phoenix] Alchemist reached Limes. Stopping.")
+                        break
+                    # Chaos failed but no Limes yet — count and maybe retry
+                    self.chaos_failures += 1
+                    if self.chaos_failures >= self.MAX_CHAOS_FAILURES:
+                        print(f"\n  [Phoenix] {self.MAX_CHAOS_FAILURES}x Chaos failed. Limes.")
+                        self.state = "limes"
+                        break
+                    else:
+                        self.alchemist.attempt_count = 0
+                        self.state = "running"
+                else:
+                    self.chaos_failures = 0  # success resets the counter
 
             if self.bb.current_round % 3 == 0:
                 self.bb.print_board()
@@ -133,9 +171,9 @@ class Phoenix:
         return result
 
     def _print_summary(self, result: dict):
-        print(f"\n{'█'*60}")
+        print(f"\n{'#'*60}")
         print(f"PHOENIX SUMMARY")
-        print(f"{'█'*60}")
+        print(f"{'#'*60}")
         print(f"Status: {result['status'].upper()}")
         print(f"Rounds: {result['rounds']}")
         print(f"Chaos: {'Yes' if result['chaos_triggered'] else 'No'}")
@@ -144,7 +182,7 @@ class Phoenix:
             print(f"  {idea}")
 
         if result["status"] == "sol":
-            print(f"\n✓ SOL: System found a solution.")
+            print(f"\n[OK] SOL: System found a solution.")
         elif result["status"] == "limes":
-            print(f"\n⚠ LIMES: Change the problem statement or try a stronger model.")
-        print(f"{'█'*60}\n")
+            print(f"\n[!!] LIMES: Change the problem statement or try a stronger model.")
+        print(f"{'#'*60}\n")

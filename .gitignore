@@ -1,11 +1,29 @@
+# Secrets
 .env
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
-.DS_Store
-chroma_db/
+*.pyd
 *.egg-info/
 dist/
 build/
+
+# Virtual environments
 .venv/
 venv/
+
+# Runtime output logs
+output*.txt
+
+# IDE / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Vector DB
+chroma_db/
+
+# Claude Code
+.claude/
